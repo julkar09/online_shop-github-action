@@ -1,5 +1,3 @@
-<<<<<<< HEAD
-# online_shop-github-action
 =======
 # Online Shop 🛍️
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
