@@ -1,0 +1,137 @@
+# CI/CD pipeline: build the Flask image, push it to Docker Hub, then
+# update the GitOps repo so ArgoCD deploys the new image to EKS.
+name: Build and Push Docker Image
+
+# When this pipeline runs:
+#   - push to main        -> build, push :latest + :sha-<commit>, update GitOps
+#   - push a v* tag        -> build, push a semver-tagged release image
+#   - pull request to main -> build only (no push), acts as a CI check
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
+
+# Docker Hub repository that images are published to (owner/name).
+env:
+  IMAGE_NAME: julkar9/online-shop
+
+jobs:
+  # Job 1: build the container image and publish it to Docker Hub.
+  build-and-push:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read # only needs to read this repo's source
+
+    steps:
+      # Pull the source code of this repo into the runner.
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Install QEMU so we can build for CPU architectures other than the
+      # runner's (needed for the linux/arm64 target below).
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      # Enable Buildx, Docker's multi-platform / cached build engine.
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # Authenticate to Docker Hub so the image can be pushed.
+      # Skipped on pull requests (nothing is pushed, and PRs from forks
+      # would not have access to the secrets anyway).
+      - name: Log in to Docker Hub
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      # Compute the image tags and OCI labels from the git context.
+      # Produces, depending on the trigger:
+      #   latest        -> only on the default branch (main)
+      #   <branch>       -> the branch name
+      #   pr-<number>    -> for pull requests
+      #   <version>      -> from a v* semver git tag
+      #   sha-<commit>   -> immutable per-commit tag (used by GitOps below)
+      - name: Extract metadata (tags, labels)
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=ref,event=branch
+            type=ref,event=pr
+            type=semver,pattern={{version}}
+            type=sha,format=short
+
+      # Build the image for both amd64 and arm64 and push it (except on PRs,
+      # where it is built only to validate the Dockerfile). Layer caching is
+      # stored in the GitHub Actions cache to speed up later runs.
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # Sync the Docker Hub repo's README/overview from DOCKERHUB.md.
+      # Only on pushes to main, so the published docs track the main branch.
+      - name: Update Docker Hub repository overview
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+        uses: peter-evans/dockerhub-description@v4
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          repository: ${{ env.IMAGE_NAME }}
+          readme-filepath: ./DOCKERHUB.md
+          short-description: "A Python Flask hello-world app packaged as a Docker image"
+
+  # Job 2: point the GitOps repo at the freshly built image so ArgoCD picks
+  # up the change and rolls it out to EKS. Runs only after a successful build
+  # on main (not on PRs or tag builds).
+  update-gitops:
+    needs: build-and-push # wait until the image is actually pushed
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    steps:
+      # Check out the separate GitOps repo. GITOPS_TOKEN is a PAT with push
+      # access to it (the default GITHUB_TOKEN can only touch this repo).
+      - name: Checkout GitOps repo
+        uses: actions/checkout@v4
+        with:
+          repository: julkar09/online_shop-github-action
+          ref: main
+          token: ${{ secrets.GITOPS_TOKEN }}
+
+      # Rewrite the deployment's image to the immutable sha-<commit> tag and
+      # commit it. That git change is what ArgoCD detects to trigger a deploy.
+      # If the tag is unchanged there is nothing to commit, so we exit cleanly.
+      - name: Bump flask-basic-app image tag
+        run: |
+          set -euo pipefail
+
+          # Same short SHA that docker/metadata-action used for the sha- tag.
+          SHORT_SHA="$(echo "${GITHUB_SHA}" | cut -c1-7)"
+          NEW_IMAGE="${IMAGE_NAME}:sha-${SHORT_SHA}"
+          MANIFEST="k8s/flask-basic-app/deployment.yaml"
+
+          # Replace whatever image tag is currently pinned with the new one.
+          sed -i -E "s|image: ${IMAGE_NAME}:.*|image: ${NEW_IMAGE}|" "${MANIFEST}"
+
+          # Commit as the bot identity and push back to the GitOps repo.
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add "${MANIFEST}"
+          if git diff --cached --quiet; then
+            echo "No image change to commit."
+            exit 0
+          fi
+          git commit -m "Deploy flask-basic-app ${NEW_IMAGE}"
+          git push
