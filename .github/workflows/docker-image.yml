@@ -4,6 +4,9 @@ on:
   push:
     branches: [ main ]
 
+permissions:
+  contents: write
+
 env:
   IMAGE: julkar9/online-shop
   MANIFEST: k8s/online-shop/online_shop_deployment.yml
@@ -36,11 +39,12 @@ jobs:
       - name: Bump image tag in the manifest
         run: |
           sed -i -E "s|(image: ${IMAGE}:).*|\1${{ steps.vars.outputs.sha }}|" "$MANIFEST"
+          cat "$MANIFEST"   # debug: দেখার জন্য ফাইলে পরিবর্তন হলো কিনা
 
       - name: Commit & push updated manifest
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add "$MANIFEST"
-          git commit -m "ci: update image tag -> ${{ steps.vars.outputs.sha }}" || echo "no changes"
+          git commit -m "ci: update image tag -> ${{ steps.vars.outputs.sha }} [skip ci]" || echo "no changes"
           git push
